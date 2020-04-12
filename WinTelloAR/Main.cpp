@@ -5,6 +5,7 @@
 */
 #include "std.h"
 #include "Main.h"
+#include "Video.h"
 using namespace wintelloar;
 
 /**
@@ -12,12 +13,15 @@ using namespace wintelloar;
 * Fixed values
 */
 const int Main::TELLO_PORT = 8889;
+const int Main::TELLO_VIDEO_PORT = 11111;
 const char* Main::TELLO_IP = "192.168.10.1";
 const char* Main::PING_CMD = "ping -n 1 ";
 const char* Main::PHASE_NAME[] = {	"PHASE_INIT", "PHASE_PING", "PHASE_SOCK", "PHASE_CONNECT", "PHASE_ONVIDEO", "PHASE_LAND",
 									"PHASE_FLIGHT", "PHASE_CLOSE", "PHASE_DONE" };
 const char* Main::TELLO_CMD[] = {	"command", "streamon", "streamoff", "iframe", "battery?", "height?", "takeoff", "land",
 									"speed %d", "cw %d", "ccw %d", "forward %d", "back %d", "up %d", "down %d", "left %d", "right %d" };
+const char* Main::VBUFFNAME = "out.mp4";
+
 
 /**
 * @brief
@@ -40,6 +44,10 @@ Main::Main()
 	m_sock_cmd_addr.sin_family = AF_INET;
 	m_sock_cmd_addr.sin_port = htons(TELLO_PORT);
 	m_sock_cmd_addr.sin_addr.S_un.S_addr = inet_addr(TELLO_IP);
+
+	m_sock_video_addr.sin_family = AF_INET;
+	m_sock_video_addr.sin_port = htons(TELLO_VIDEO_PORT);
+	m_sock_video_addr.sin_addr.S_un.S_addr = INADDR_ANY;
 	return;
 }
 
@@ -129,6 +137,7 @@ void Main::Psock(void)
 	}
 	u_long ioctl_val_cmd = 1;
 	ioctlsocket(m_sock_cmd, FIONBIO, &ioctl_val_cmd);
+
 	for (int p = 0; p < 3; p++) {
 		SockRcvStatus();
 
@@ -149,6 +158,20 @@ void Main::Psock(void)
 		SockRcvStatus();
 	}
 
+	m_sock_video = socket(AF_INET, SOCK_DGRAM, 0);
+	if (m_sock_video == INVALID_SOCKET) {
+		std::cout << "video socket err : " << WSAGetLastError() << std::endl;
+		m_now_phase = PHASE_CLOSE;
+		return;
+	}
+	if (bind(m_sock_video, (struct sockaddr*) & m_sock_video_addr, sizeof(m_sock_video_addr)) != 0) {
+		std::cout << "video bind err : " << WSAGetLastError() << std::endl;
+		m_now_phase = PHASE_CLOSE;
+		return;
+	}
+	u_long ioctl_val_video = 1;
+	ioctlsocket(m_sock_video, FIONBIO, &ioctl_val_video);
+
 	if (m_responce[RES_OK]) {
 		m_now_phase = PHASE_CONNECT;
 	}
@@ -166,6 +189,9 @@ void Main::Psock(void)
 void Main::Pconnect(void)
 {
 	PrintPhase();
+	std::remove(VBUFFNAME);
+	m_vbufstream.open(VBUFFNAME, std::ios::out | std::ios::binary);
+	m_vbuf_totalinsize = 0;
 
 	m_now_phase = PHASE_ONVIDEO;
 	return;
@@ -176,9 +202,44 @@ void Main::Pconnect(void)
 */
 void Main::Ponvideo(void)
 {
-	PrintPhase();
+//	PrintPhase();
+	if (m_phase_counter[PHASE_ONVIDEO] % 50 == 0) {
+		SockSendCmd(CMD_IFRAME, 0);
+	}
+	else {
+		if (m_phase_counter[PHASE_ONVIDEO] % 20 == 0) {
+			SockSendCmd(CMD_GET_BATTERY, 0);
+		}
+	}
+	SockRcvStatus();
 
-	m_now_phase = PHASE_LAND;
+	while (1) {
+		memset(m_video_buff, 0, sizeof(m_video_buff));
+		int rv = recv(m_sock_video, m_video_buff, sizeof(m_video_buff), 0);
+		if (rv > 0) {
+			m_vbufstream.write(m_video_buff, rv);
+			m_vbuf_totalinsize += rv;
+//			std::cout << " recv video(" << rv << ") :" << std::endl;
+		}
+		else {
+			break;
+		}
+	}
+	Sleep(10);
+
+	if (m_vbuf_totalinsize > (1024 * 32)) {
+//		if (m_vdecoder == NULL) {
+//			m_vdecoder = new Video(VBUFFNAME);
+//		}
+//		else {
+//			int counter;
+//			if (m_vdecoder->GetDecodeStatus(counter)) {
+//				cv::Mat *get_flame = m_vdecoder->DoDecode();
+//			}
+//		}
+	}
+
+	m_now_phase = PHASE_ONVIDEO;
 	return;
 }
 
@@ -210,7 +271,9 @@ void Main::Pflight()
 void Main::Pclose(void)
 {
 	PrintPhase();
+	m_vbufstream.close();
 	closesocket(m_sock_cmd);
+	closesocket(m_sock_video);
 	WSACleanup();
 
 	m_now_phase = PHASE_DONE;
@@ -250,7 +313,7 @@ int Main::SockRcvStatus()
 	int rc = recv(m_sock_cmd, m_sock_status_buff, sizeof(m_sock_status_buff), 0);
 	if (rc < 1) {
 		if (WSAGetLastError() == WSAEWOULDBLOCK) {
-			std::cout << "  recv cmd : non" << std::endl;
+//			std::cout << "  recv cmd : non" << std::endl;
 		}
 		else {
 			std::cout << "  recv cmd err : " << WSAGetLastError() << std::endl;
